@@ -18,6 +18,7 @@ except Exception:
 import logging
 import math
 import pprint
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -33,6 +34,15 @@ from src.utils.checkpoint_loader import robust_checkpoint_loader
 from src.utils.distributed import AllReduce, init_distributed
 from src.utils.logging import AverageMeter, CSVLogger
 
+import tempfile
+import wandb
+
+# Fix for "AF_UNIX path too long" error
+short_tmp = "/tmp/vjepa_run"
+os.makedirs(short_tmp, exist_ok=True)
+tempfile.tempdir = short_tmp
+os.environ["TMPDIR"] = short_tmp
+
 logging.basicConfig()
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -43,6 +53,28 @@ torch.manual_seed(_GLOBAL_SEED)
 torch.backends.cudnn.benchmark = True
 
 pp = pprint.PrettyPrinter(indent=4)
+
+
+class FocalLoss(torch.nn.Module):
+    def __init__(self, alpha=1.0, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        # inputs: [B, C] logits
+        # targets: [B] class indices
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = (self.alpha * (1 - pt) ** self.gamma * ce_loss)
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
 
 
 def main(args_eval, resume_preempt=False):
@@ -122,6 +154,16 @@ def main(args_eval, resume_preempt=False):
     world_size, rank = init_distributed()
     logger.info(f"Initialized (rank/world-size) {rank}/{world_size}")
 
+    # <--- WANDB INITIALIZATION --->
+    if rank == 0:
+        wandb_run_name = eval_tag if eval_tag else "eval_video_classification"
+        wandb.init(
+            project="miracle-video-classification-existing-methods",  # Change this to your preferred project name
+            name=wandb_run_name,
+            config=args_eval,
+            resume="allow" if resume_preempt else None
+        )
+
     # -- log/checkpointing paths
     folder = os.path.join(pretrain_folder, "video_classification_frozen/")
     if eval_tag is not None:
@@ -158,7 +200,9 @@ def main(args_eval, resume_preempt=False):
         ).to(device)
         for _ in opt_kwargs
     ]
-    classifiers = [DistributedDataParallel(c, static_graph=True) for c in classifiers]
+    # -- wrap with DDP only for multi-GPU or multi-node setups
+    if world_size > 1:
+        classifiers = [DistributedDataParallel(c, static_graph=True) for c in classifiers]
     print(classifiers[0])
 
     train_loader, train_sampler = make_dataloader(
@@ -222,20 +266,49 @@ def main(args_eval, resume_preempt=False):
             [s.step() for s in scheduler]
             [wds.step() for wds in wd_scheduler]
 
-    def save_checkpoint(epoch):
+    def save_checkpoint(epoch, mean_val_acc, best_val_acc, val_heads, best_per_head, mean_per_head, min_per_head, best_epoch_per_head, is_best=False):
+
         all_classifier_dicts = [c.state_dict() for c in classifiers]
         all_opt_dicts = [o.state_dict() for o in optimizer]
 
         save_dict = {
             "classifiers": all_classifier_dicts,
             "opt": all_opt_dicts,
-            "scaler": None if scaler is None else [s.state_dict() for s in scaler],
+            "scaler": None if scaler is None else [None if s is None else s.state_dict() for s in scaler],
             "epoch": epoch,
             "batch_size": batch_size,
             "world_size": world_size,
+            "mean_val_acc": float(mean_val_acc),
+            "best_val_acc": float(best_val_acc),
+            "val_acc_per_head": np.asarray(val_heads, dtype=float).tolist(),
+            "best_val_acc_per_head": np.asarray(best_per_head, dtype=float).tolist(),
+            "mean_val_acc_per_head": np.asarray(mean_per_head, dtype=float).tolist(),
+            "min_val_acc_per_head": np.asarray(min_per_head, dtype=float).tolist(),
+            "best_epoch_per_head": np.asarray(best_epoch_per_head, dtype=int).tolist(),
         }
+
         if rank == 0:
-            torch.save(save_dict, latest_path)
+            # 1. Always save latest
+            _latest_path = os.path.join(folder, "latest.pt")
+            torch.save(save_dict, _latest_path)
+
+            # 2. Save per-epoch snapshot
+            epoch_path = os.path.join(folder, f"epoch_{epoch:03d}.pt")
+            torch.save(save_dict, epoch_path)
+
+            # 3. Save BEST checkpoint
+            if is_best:
+                best_path = os.path.join(folder, "best.pt")
+                torch.save(save_dict, best_path)
+                logger.info(f"Generated new best model: {best_path}")
+
+    # ---- per-head running stats ----
+    best_per_head = None
+    sum_per_head = None
+    min_per_head = None
+    best_epoch_per_head = None
+    count_epochs = 0
+    best_val_acc = 0.0
 
     # TRAIN LOOP
     for epoch in range(start_epoch, num_epochs):
@@ -244,7 +317,7 @@ def main(args_eval, resume_preempt=False):
         if val_only:
             train_acc = -1.0
         else:
-            train_acc = run_one_epoch(
+            train_acc, _ = run_one_epoch(
                 device=device,
                 training=True,
                 encoder=encoder,
@@ -257,7 +330,7 @@ def main(args_eval, resume_preempt=False):
                 use_bfloat16=use_bfloat16,
             )
 
-        val_acc = run_one_epoch(
+        val_acc, val_heads = run_one_epoch(
             device=device,
             training=False,
             encoder=encoder,
@@ -270,14 +343,63 @@ def main(args_eval, resume_preempt=False):
             use_bfloat16=use_bfloat16,
         )
 
-        logger.info("[%5d] train: %.3f%% test: %.3f%%" % (epoch + 1, train_acc, val_acc))
+        # ---- update per-head running stats ----
+        count_epochs += 1
+        if best_per_head is None:
+            best_per_head = val_heads.copy()
+            sum_per_head = val_heads.copy()
+            min_per_head = val_heads.copy()
+            best_epoch_per_head = np.full_like(val_heads, epoch + 1, dtype=int)
+        else:
+            # For per-head, we need similar conditional logic for "improved"
+            improved = val_heads > best_per_head  # Higher is better for classification
+            best_per_head = np.maximum(best_per_head, val_heads)
+            best_epoch_per_head[improved] = epoch + 1
+            sum_per_head += val_heads
+            min_per_head = np.minimum(min_per_head, val_heads)
+
+        mean_per_head = sum_per_head / count_epochs
+        mean_val_acc = sum_per_head.max() / count_epochs  # Average of best head
+
+        # Determine if this is best
+        is_best = False
+        if float(val_acc) > best_val_acc:
+            best_val_acc = float(val_acc)
+            is_best = True
+
+        logger.info("[%5d] train: %.3f%% test: %.3f%% (Best: %.3f%%)" % (epoch + 1, train_acc, val_acc, best_val_acc))
         if rank == 0:
             csv_logger.log(epoch + 1, train_acc, val_acc)
 
+            # <--- WANDB LOGGING --->
+            wandb.log({
+                "train/acc": train_acc,
+                "val/acc": val_acc,
+                "val/best_acc": best_val_acc,
+                "val/mean_acc": mean_val_acc
+            }, epoch + 1)
+
         if val_only:
+            # <--- WANDB CLEANUP FOR VAL ONLY --->
+            if rank == 0:
+                wandb.finish()
             return
 
-        save_checkpoint(epoch + 1)
+        save_checkpoint(
+            epoch + 1,
+            mean_val_acc,
+            best_val_acc,
+            val_heads,
+            best_per_head,
+            mean_per_head,
+            min_per_head,
+            best_epoch_per_head,
+            is_best=is_best,
+        )
+
+    # <--- WANDB CLEANUP FOR FULL TRAINING LOOP --->
+    if rank == 0:
+        wandb.finish()
 
 
 def run_one_epoch(
@@ -298,6 +420,11 @@ def run_one_epoch(
 
     criterion = torch.nn.CrossEntropyLoss()
     top1_meters = [AverageMeter() for _ in classifiers]
+
+    # For subject-level aggregation
+    subject_probs = defaultdict(list)
+    subject_targets = {}
+
     for itr, data in enumerate(data_loader):
         if training:
             [s.step() for s in scheduler]
@@ -313,6 +440,9 @@ def run_one_epoch(
             labels = data[1].to(device)
             batch_size = len(labels)
 
+            # NEW: Extract patient IDs (may be None for legacy datasets)
+            patient_ids = data[3] if len(data) > 3 else [None] * batch_size
+
             # Forward and prediction
             with torch.no_grad():
                 outputs = encoder(clips, clip_indices)
@@ -325,6 +455,20 @@ def run_one_epoch(
         losses = [[criterion(o, labels) for o in coutputs] for coutputs in outputs]
         with torch.no_grad():
             outputs = [sum([F.softmax(o, dim=1) for o in coutputs]) / len(coutputs) for coutputs in outputs]
+
+            # NEW: For non-training (val/test), aggregate by subject
+            if not training:
+                # Accumulate predictions for subject-level aggregation
+                num_output_heads = len(outputs)
+                # outputs is a list of tensors, one per head: outputs[h][i] -> prob tensor for sample i and head h
+                for i, (label, subj_id) in enumerate(zip(labels, patient_ids)):
+                    if subj_id is None:
+                        continue
+                    per_sample_head_probs = [outputs[h][i].detach().cpu() for h in range(num_output_heads)]
+                    subject_probs[subj_id].append(per_sample_head_probs)
+                    subject_targets[subj_id] = label.item()
+
+            # Still compute video-level accuracy for logging
             top1_accs = [100.0 * coutputs.max(dim=1).indices.eq(labels).sum() / batch_size for coutputs in outputs]
             top1_accs = [float(AllReduce.apply(t1a)) for t1a in top1_accs]
             for t1m, t1a in zip(top1_meters, top1_accs):
@@ -353,7 +497,30 @@ def run_one_epoch(
                 )
             )
 
-    return _agg_top1.max()
+    # NEW: Compute subject-level accuracy if in non-training (val/test) mode
+    if not training and subject_probs:
+        subj_preds = []
+        subj_targets_list = []
+
+        # Choose the best head based on video-level validation metrics (_agg_top1 holds per-head accuracies)
+        try:
+            best_head_idx = int(np.argmax(_agg_top1)) if len(_agg_top1) > 0 else 0
+        except Exception:
+            best_head_idx = 0
+
+        for subj_id, probs_list in subject_probs.items():
+            # probs_list is a list over samples for this subject; each element is a list of per-head prob tensors
+            # Collect probabilities for the selected best head across all samples for this subject
+            head_probs = [sample_probs[best_head_idx] for sample_probs in probs_list]
+            avg_prob = torch.stack(head_probs).mean(dim=0)
+            subj_preds.append(torch.argmax(avg_prob).item())
+            subj_targets_list.append(subject_targets[subj_id])
+
+        subject_level_acc = np.mean([p == t for p, t in zip(subj_preds, subj_targets_list)]) * 100
+        logger.info(f"Subject-level accuracy (head {best_head_idx}): {subject_level_acc:.2f}%")
+        _agg_top1 = np.array([subject_level_acc] + [_agg_top1.max() if len(_agg_top1) > 0 else subject_level_acc])
+
+    return _agg_top1.max(), _agg_top1
 
 
 def load_checkpoint(device, r_path, classifiers, opt, scaler, val_only=False):
@@ -362,7 +529,21 @@ def load_checkpoint(device, r_path, classifiers, opt, scaler, val_only=False):
 
     # -- loading encoder
     pretrained_dict = checkpoint["classifiers"]
-    msg = [c.load_state_dict(pd) for c, pd in zip(classifiers, pretrained_dict)]
+    # Handle DDP/non-DDP state_dict mismatch by removing "module." prefix if needed
+    msg = []
+    for c, pd in zip(classifiers, pretrained_dict):
+        # Check if state_dict has "module." prefix but classifier doesn't (or vice versa)
+        is_wrapped = isinstance(c, DistributedDataParallel)
+        has_module_prefix = any(k.startswith("module.") for k in pd.keys()) if pd else False
+
+        if has_module_prefix and not is_wrapped:
+            # Remove "module." prefix from saved state_dict
+            pd = {k.replace("module.", "", 1): v for k, v in pd.items()}
+        elif not has_module_prefix and is_wrapped:
+            # Add "module." prefix for wrapped classifier
+            pd = {"module." + k: v for k, v in pd.items()}
+
+        msg.append(c.load_state_dict(pd, strict=False))
 
     if val_only:
         logger.info(f"loaded pretrained classifier from epoch with msg: {msg}")

@@ -91,6 +91,18 @@ def make_videodataset(
             dataset, num_replicas=world_size, rank=rank, shuffle=True
         )
 
+    # Use custom collate function if none specified
+    if collator is None:
+        from src.datasets.utils.utils import default_collate_with_patient_ids
+        collator = default_collate_with_patient_ids
+        logger.info("Using default collator with patient_id propagation enabled.")
+    else:
+        collator_name = getattr(collator, "__name__", collator.__class__.__name__)
+        logger.info(
+            "Using custom collator %s; ensure it preserves patient_id if subject-level aggregation is needed.",
+            collator_name,
+        )
+
     if deterministic:
         data_loader = torch.utils.data.DataLoader(
             dataset,
@@ -174,7 +186,8 @@ class VideoDataset(torch.utils.data.Dataset):
             )
 
         # Load video paths and labels
-        samples, labels = [], []
+        samples, labels, patient_ids = [], [], []
+        has_patient_id_column = False
         self.num_samples_per_dataset = []
         for data_path in self.data_paths:
 
@@ -186,6 +199,12 @@ class VideoDataset(torch.utils.data.Dataset):
                     data = pd.read_csv(data_path, header=None, delimiter="::")
                 samples += list(data.values[:, 0])
                 labels += list(data.values[:, 1])
+                # Load patient_id from 3rd column if available
+                if data.shape[1] > 2:
+                    has_patient_id_column = True
+                    patient_ids += list(data.values[:, 2])
+                else:
+                    patient_ids += [None] * len(data)
                 num_samples = len(data)
                 self.num_samples_per_dataset.append(num_samples)
 
@@ -194,6 +213,7 @@ class VideoDataset(torch.utils.data.Dataset):
                 data = list(map(lambda x: repr(x)[1:-1], data))
                 samples += data
                 labels += [0] * len(data)
+                patient_ids += [None] * len(data)
                 num_samples = len(data)
                 self.num_samples_per_dataset.append(len(data))
 
@@ -209,6 +229,21 @@ class VideoDataset(torch.utils.data.Dataset):
 
         self.samples = samples
         self.labels = labels
+        self.patient_ids = patient_ids
+
+        patient_id_count = sum(0 if pd.isna(pid) else 1 for pid in self.patient_ids)
+        missing_patient_id_count = len(self.patient_ids) - patient_id_count
+        self.has_patient_id_column = has_patient_id_column
+
+        logger.info(
+            "Patient ID summary: %d/%d samples have patient_id values (%d missing); third CSV column present=%s.",
+            patient_id_count,
+            len(self.patient_ids),
+            missing_patient_id_count,
+            self.has_patient_id_column,
+        )
+        if patient_id_count > 0:
+            logger.info("Subject-level aggregation can be performed downstream for samples with patient_id values.")
 
     def __getitem__(self, index):
         sample = self.samples[index]
@@ -243,6 +278,7 @@ class VideoDataset(torch.utils.data.Dataset):
 
         # Label/annotations for video
         label = self.labels[index]
+        patient_id = self.patient_ids[index]
 
         def split_into_clips(video):
             """Split video into a list of clips"""
@@ -257,7 +293,7 @@ class VideoDataset(torch.utils.data.Dataset):
         if self.transform is not None:
             buffer = [self.transform(clip) for clip in buffer]
 
-        return buffer, label, clip_indices
+        return buffer, label, clip_indices, patient_id
 
     def get_item_image(self, index):
         sample = self.samples[index]
@@ -271,6 +307,7 @@ class VideoDataset(torch.utils.data.Dataset):
         except Exception:
             return
         label = self.labels[index]
+        patient_id = self.patient_ids[index]
         clip_indices = [np.arange(start=0, stop=fpc, dtype=np.int32)]
 
         # Expanding the input image [3, H, W] ==> [T, 3, H, W]
@@ -284,7 +321,7 @@ class VideoDataset(torch.utils.data.Dataset):
         if self.transform is not None:
             buffer = [self.transform(buffer)]
 
-        return buffer, label, clip_indices
+        return buffer, label, clip_indices, patient_id
 
     def loadvideo_decord(self, sample, fpc):
         """Load video content using Decord"""

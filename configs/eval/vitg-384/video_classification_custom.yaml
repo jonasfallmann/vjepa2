@@ -1,0 +1,129 @@
+# Video Classification Evaluation Configuration for vjepa 2
+# Based on reference configuration for custom video classification task
+#
+# Configuration for attentive probe-based video classification evaluation
+# Includes both attentive probe and linear probe optimization hyperparameters
+
+nodes: 1  # TODO: Adjust based on your number of available GPU nodes
+tasks_per_node: 1  # TODO: Adjust based on GPUs per node
+cpus_per_task: 32
+mem_per_gpu: 80G
+num_workers: 8
+tag: kuk-mr400-vjepa2-vitg-224  # TODO: Update with meaningful experiment identifier
+eval_name: video_classification_frozen
+folder: /system/user/publicwork/fallmann/miracle/vjepa2/experiments/video_classification_vjepa2  # TODO: Update output folder path
+resume_checkpoint: true
+
+experiment:
+  classifier:
+    # Probe configuration - supports both linear and attentive probes
+    task_type: classification
+    probe_type: attentive      # Set to 'linear' for linear probe, 'attentive' for attention-based probe
+    num_heads: 16              # Ignored for linear probe, used for attentive probe
+    num_probe_blocks: 4        # Ignored for linear probe, number of transformer blocks for attentive probe
+
+  data:
+    dataset_type: VideoDataset
+    # TODO: Update these paths to your video classification dataset
+    dataset_train: /system/user/publicwork/fallmann/miracle/EchoJEPA/experiments/kuk_mr_400/server_echojepa_ptid/train_val_4class.csv
+    dataset_val:   /system/user/publicwork/fallmann/miracle/EchoJEPA/experiments/kuk_mr_400/server_echojepa_ptid/test_4class.csv
+
+
+    # TODO: Update num_classes based on your dataset
+    num_classes: 4             # Number of classes in your dataset
+
+    # Video sampling parameters
+    resolution: 224            # Input resolution (matches model)
+    frames_per_clip: 32        # Number of frames per video clip
+    frame_step: 1              # Step between frames (1 = consecutive frames)
+    num_segments: 4            # Number of temporal segments to sample from video
+    num_views_per_segment: 1   # Number of spatial views per segment
+
+  optimization:
+    batch_size: 10
+    num_epochs: 20
+    use_bfloat16: true
+    use_pos_embed: false
+
+    # Hyperparameter grid for attentive/linear probe
+    # Grid search over learning rates and weight decay values
+    multihead_kwargs:
+    # --- Group 1: weight_decay=0.01 ---
+    - final_lr: 0.0
+      final_weight_decay: 0.01
+      lr: 0.001
+      start_lr: 0.001
+      warmup: 0.0
+      weight_decay: 0.01
+    - final_lr: 0.0
+      final_weight_decay: 0.01
+      lr: 0.0005
+      start_lr: 0.0005
+      warmup: 0.0
+      weight_decay: 0.01
+    - final_lr: 0.0
+      final_weight_decay: 0.01
+      lr: 0.0001
+      start_lr: 0.0001
+      warmup: 0.0
+      weight_decay: 0.01
+
+    # --- Group 2: weight_decay=0.1 ---
+    - final_lr: 0.0
+      final_weight_decay: 0.1
+      lr: 0.001
+      start_lr: 0.001
+      warmup: 0.0
+      weight_decay: 0.1
+    - final_lr: 0.0
+      final_weight_decay: 0.1
+      lr: 0.0005
+      start_lr: 0.0005
+      warmup: 0.0
+      weight_decay: 0.1
+    - final_lr: 0.0
+      final_weight_decay: 0.1
+      lr: 0.0001
+      start_lr: 0.0001
+      warmup: 0.0
+      weight_decay: 0.1
+
+    # --- Group 3: weight_decay=0.4 ---
+    - final_lr: 0.0
+      final_weight_decay: 0.4
+      lr: 0.001
+      start_lr: 0.001
+      warmup: 0.0
+      weight_decay: 0.4
+    - final_lr: 0.0
+      final_weight_decay: 0.4
+      lr: 0.0005
+      start_lr: 0.0005
+      warmup: 0.0
+      weight_decay: 0.4
+    - final_lr: 0.0
+      final_weight_decay: 0.4
+      lr: 0.0001
+      start_lr: 0.0001
+      warmup: 0.0
+      weight_decay: 0.4
+
+model_kwargs:
+  # vjepa 2 pretrained checkpoint (1B ViT-Giant model)
+  checkpoint: /system/user/publicwork/fallmann/miracle/vjepa/checkpoints/vjepa2_vitg_384.pt
+  module_name: evals.video_classification_frozen.modelcustom.vit_encoder_multiclip
+
+  pretrain_kwargs:
+    encoder:
+      checkpoint_key: target_encoder
+      img_temporal_dim_size: null  # vjepa 2 uses null (no separate temporal dimension)
+      model_name: vit_giant_xformers
+      patch_size: 16
+      tubelet_size: 2
+      uniform_power: true
+      use_rope: true
+
+  wrapper_kwargs:
+    max_frames: 128
+    use_pos_embed: false
+
